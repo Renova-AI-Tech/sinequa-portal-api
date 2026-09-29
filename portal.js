@@ -301,7 +301,178 @@ async function blocoBusca(){
   return { ref: new Date().toISOString().slice(0,10), pacientes };
 }
 
-const BLOCOS = { ano: blocoAno, mes: blocoMes, dia: blocoDia, producao: blocoProd, busca: blocoBusca };
+// ============================================================
+// ESTOQUE — window.ESTOQUE (módulo Estoque do portal). Lê a camada mart de estoque
+// (sinequa-fb/mart-estoque.sql: estoque_sku, estoque_lote, estoque_ajuste, compra,
+// estoque_snapshot) e as linhas de consumo (stg.venda_componente).
+//
+// Decisões — não reverter sem motivo:
+// · Estoque ÓTIMO é calculado no FRONT (prazo e ciclo são ajustáveis na tela). Aqui só
+//   vão os insumos: consumo/dia (90d), desvio/dia (a partir do consumo SEMANAL de 13
+//   semanas, com semana zerada contando), z pela curva (A 95% · B 90% · C 85%), validade
+//   média dos lotes comprados (o máximo não pode passar do que se usa antes de vencer)
+//   e o último preço pago.
+// · CUSTO REAL = soma de prcusto (custo R$ da linha, já com a perda — conferido no
+//   Peptistrong: (72+3,6)g × 1,18 = 89,21). Linha é SUSPEITA quando custa > R$ 500 e mais
+//   que 1,5× o preço de venda da fórmula inteira — em manipulação isso não existe; são
+//   requisições de teste/canceladas ou unidade trocada (ex.: PANCREATINA 250.000 g,
+//   2 × R$ 77,5 mil em abr/26; VITAMINA D 5UG em UI). Excluídas do custo, listadas à parte.
+// · Perda de verdade = ajuste de BAIXA com causa 'descarte por validade' ou 'perda sem
+//   causa identificada' (mart.estoque_ajuste). Recontagem/quebra/digitação não é perda.
+// ============================================================
+const SQL_LINHA_CUSTO = `
+  fv AS (SELECT cdfil, nrrqu, serier, sum(prcobr) preco FROM mart.f_venda GROUP BY 1,2,3),
+  lc AS (SELECT c.cdpro, c.nrrqu, c.dtentr, c.unida,
+                (c.qtreal::numeric + coalesce(nullif(c.qtperda::text,'')::numeric,0)) q,
+                c.prcusto::numeric custo,
+                (c.prcusto::numeric > 500 AND c.prcusto::numeric > 1.5*greatest(coalesce(fv.preco,0),1)) suspeita
+           FROM stg.venda_componente c
+           LEFT JOIN fv ON fv.cdfil=c.cdfil AND fv.nrrqu=c.nrrqu AND fv.serier=c.serier)`;
+
+async function blocoEstoque(){
+  const [skus, resumo, parados, lotes, mensal, snap, topCusto, susp, forn] = await Promise.all([
+    // itens COM giro — base do estoque ótimo e da fila de compra
+    mart(`WITH sem AS (
+        SELECT cdpro, date_trunc('week', dtentr)::date wk,
+               sum(qtreal::numeric + coalesce(nullif(qtperda::text,'')::numeric,0)) q
+          FROM stg.venda_componente WHERE dtentr >= current_date - 91 GROUP BY 1,2),
+      wks AS (SELECT generate_series(date_trunc('week', current_date - 91)::date,
+                                     date_trunc('week', current_date)::date - 7, interval '7 day')::date wk),
+      var AS (SELECT g.cdpro, stddev_samp(coalesce(s.q,0)) sd_sem
+                FROM (SELECT DISTINCT cdpro FROM sem) g CROSS JOIN wks w
+                LEFT JOIN sem s ON s.cdpro=g.cdpro AND s.wk=w.wk GROUP BY 1),
+      comp AS (SELECT cdpro, max(dtent)::date ult_compra,
+                      (array_agg(fornecid ORDER BY dtent DESC))[1] ult_forn,
+                      (array_agg(prunir::numeric ORDER BY dtent DESC))[1] ult_preco,
+                      avg((dtval::date - dtent::date)::numeric) FILTER (WHERE dtval > dtent) vida,
+                      count(DISTINCT nrnot) FILTER (WHERE dtent >= current_date - 365) compras12
+                 FROM mart.compra GROUP BY 1),
+      said AS (SELECT cdpro, max(dtentr)::date ult_saida FROM stg.venda_componente GROUP BY 1)
+      SELECT s.cdpro, s.produto, s.unida, s.curva, s.grupo_nome grupo, s.perecivel, s.situacao, s.prioridade, s.motivo,
+             round(s.saldo::numeric,3) saldo, round(s.custo::numeric,4) custo, round(s.valor::numeric,2) valor,
+             round(s.consumo_mes::numeric/30.0,4) cdia, round(coalesce(v.sd_sem,0)::numeric/sqrt(7)::numeric,4) sddia,
+             s.dias_cobertura cob, round(s.minimo::numeric,3) minimo, round(s.maximo::numeric,3) maximo,
+             round(s.valor_vencido::numeric,2) vencido, round(s.valor_risco::numeric,2) risco,
+             c.ult_compra, c.ult_forn, round(coalesce(c.ult_preco, s.custo::numeric),4) preco,
+             round(c.vida) vida, coalesce(c.compras12,0) compras12, d.ult_saida
+        FROM mart.estoque_sku s
+        LEFT JOIN var v ON v.cdpro=s.cdpro LEFT JOIN comp c ON c.cdpro=s.cdpro LEFT JOIN said d ON d.cdpro=s.cdpro
+       WHERE s.consumo_mes > 0`),
+    mart(`SELECT situacao, prioridade, grupo_nome grupo, count(*) skus, round(sum(valor)::numeric,2) valor,
+                 round(sum(valor_vencido)::numeric,2) vencido, round(sum(valor_risco)::numeric,2) risco
+            FROM mart.estoque_sku GROUP BY 1,2,3`),
+    // parados: sem saída em 90 dias e com saldo — capital imobilizado
+    mart(`SELECT s.cdpro, s.produto, s.unida, s.curva, s.grupo_nome grupo, round(s.saldo::numeric,3) saldo,
+                 round(s.valor::numeric,2) valor, round(s.valor_vencido::numeric,2) vencido, s.proxima_validade::date validade,
+                 d.ult_saida, c.ult_compra
+            FROM mart.estoque_sku s
+            LEFT JOIN (SELECT cdpro, max(dtentr)::date ult_saida FROM stg.venda_componente GROUP BY 1) d ON d.cdpro=s.cdpro
+            LEFT JOIN (SELECT cdpro, max(dtent)::date ult_compra FROM mart.compra GROUP BY 1) c ON c.cdpro=s.cdpro
+           WHERE s.situacao='Parado' AND s.valor > 0 ORDER BY s.valor DESC LIMIT 400`),
+    // lotes: vencidos e em risco — só perecível (M/R/D) e sem lote fantasma
+    mart(`SELECT cdpro, produto, grupo_nome grupo, nrlot, dtval::date validade, dias, unida,
+                 round(saldo::numeric,3) saldo, round(valor::numeric,2) valor, round(valor_em_risco::numeric,2) risco,
+                 round(qt_vence_antes_girar::numeric,3) qt_risco, situacao_validade
+            FROM mart.estoque_lote
+           WHERE perecivel AND NOT fantasma AND saldo > 0 AND (dias < 0 OR valor_em_risco > 0 OR dias <= 90)
+           ORDER BY valor DESC LIMIT 600`),
+    // série mensal: custo real consumido × compras × perdas (balanço do Thome)
+    mart(`WITH ${SQL_LINHA_CUSTO},
+      cons AS (SELECT to_char(dtentr,'YYYY-MM') mes, round(sum(custo) FILTER (WHERE NOT suspeita)) custo,
+                      round(sum(custo) FILTER (WHERE suspeita)) suspeito FROM lc GROUP BY 1),
+      comp AS (SELECT to_char(dtent,'YYYY-MM') mes, round(sum(valor)) compras, count(DISTINCT nrnot) notas FROM mart.compra GROUP BY 1),
+      aj AS (SELECT to_char(datarf,'YYYY-MM') mes,
+                    round(sum(valor) FILTER (WHERE tipo='baixa' AND causa='descarte por validade')) validade,
+                    round(sum(valor) FILTER (WHERE tipo='baixa' AND causa='perda sem causa identificada')) sem_causa,
+                    round(sum(valor) FILTER (WHERE tipo='baixa' AND causa NOT IN ('descarte por validade','perda sem causa identificada'))) outras
+               FROM mart.estoque_ajuste GROUP BY 1)
+      SELECT m.mes, coalesce(cons.custo,0) custo, coalesce(cons.suspeito,0) suspeito, coalesce(comp.compras,0) compras,
+             coalesce(comp.notas,0) notas, coalesce(aj.validade,0) validade, coalesce(aj.sem_causa,0) sem_causa, coalesce(aj.outras,0) outras
+        FROM (SELECT mes FROM cons UNION SELECT mes FROM comp) m
+        LEFT JOIN cons ON cons.mes=m.mes LEFT JOIN comp ON comp.mes=m.mes LEFT JOIN aj ON aj.mes=m.mes
+       WHERE m.mes >= '2025-01' AND m.mes <= to_char(current_date,'YYYY-MM') ORDER BY 1`),
+    mart(`SELECT to_char(data,'YYYY-MM-DD') data, round(sum(valor)) valor,
+                 round(sum(valor) FILTER (WHERE situacao IN ('Excesso','Parado'))) parado,
+                 round(sum(valor_vencido)) vencido, count(*) FILTER (WHERE situacao='Ruptura') ruptura
+            FROM mart.estoque_snapshot GROUP BY 1 ORDER BY 1`),
+    // onde está o custo: insumos que mais pesam em 12 meses + preço pago antes × agora
+    mart(`WITH ${SQL_LINHA_CUSTO},
+      c12 AS (SELECT cdpro, sum(custo) custo12, sum(q) q12 FROM lc WHERE NOT suspeita AND dtentr >= current_date - 365 GROUP BY 1),
+      pr AS (SELECT cdpro,
+                    sum(prunir::numeric*qtreal::numeric) FILTER (WHERE dtent <  current_date-180) / nullif(sum(qtreal::numeric) FILTER (WHERE dtent <  current_date-180),0) antes,
+                    sum(prunir::numeric*qtreal::numeric) FILTER (WHERE dtent >= current_date-180) / nullif(sum(qtreal::numeric) FILTER (WHERE dtent >= current_date-180),0) agora
+               FROM mart.compra WHERE dtent >= current_date - 365 GROUP BY 1)
+      SELECT c12.cdpro, coalesce(p.descrprd,'(sem cadastro)') produto, p.unida, round(c12.custo12) custo12, round(c12.q12,1) q12,
+             round(pr.antes,4) preco_antes, round(pr.agora,4) preco_agora
+        FROM c12 LEFT JOIN stg.dim_produto p ON p.cdpro=c12.cdpro LEFT JOIN pr ON pr.cdpro=c12.cdpro
+       ORDER BY c12.custo12 DESC LIMIT 30`),
+    mart(`WITH ${SQL_LINHA_CUSTO}
+      SELECT to_char(lc.dtentr,'YYYY-MM-DD') data, lc.nrrqu, lc.cdpro, coalesce(p.descrprd,'(sem cadastro)') produto,
+             round(lc.q,2) q, lc.unida, round(lc.custo) custo
+        FROM lc LEFT JOIN stg.dim_produto p ON p.cdpro=lc.cdpro WHERE lc.suspeita ORDER BY lc.custo DESC LIMIT 80`),
+    // compras por fornecedor em 12 meses (nome vem de stg.dim_fornecedor, mais abaixo)
+    mart(`SELECT fornecid, round(sum(valor)) valor, count(DISTINCT nrnot) notas, count(DISTINCT cdpro) itens, max(dtent)::date ultima
+            FROM mart.compra WHERE dtent >= current_date - 365 GROUP BY 1 ORDER BY 2 DESC LIMIT 25`),
+  ]);
+  const num = r => { for(const k in r) if(typeof r[k]==='string' && /^-?\d+(\.\d+)?$/.test(r[k]) && !['cdpro','nrlot','fornecid','nrrqu'].includes(k)) r[k]=Number(r[k]); return r; };
+  const d = x => x ? String(x).slice(0,10) : null;
+  // Fornecedor (stg.dim_fornecedor = FC02000) e duplicatas das compras (stg.compra_duplicata = FC11200).
+  // Tolerante: se o ETL ainda não criou as tabelas, o portal segue mostrando só o código.
+  let fornNomes = {}, pagar = [];
+  try{
+    const [nomes, venc, prazo] = await Promise.all([
+      mart(`SELECT f.fornecid, coalesce(nullif(f.fanta,''), f.razao) nome, f.munic cidade, f.unfed uf,
+                   f.diasprazo, f.vrminfat
+              FROM stg.dim_fornecedor f WHERE f.fornecid IN (SELECT DISTINCT fornecid FROM mart.compra)`),
+      // o que ainda vence das compras já feitas (DTDUP de hoje em diante), por mês
+      mart(`SELECT to_char(dtdup,'YYYY-MM') mes, round(sum(vrdup)) valor, count(*) parcelas
+              FROM stg.compra_duplicata WHERE dtdup >= current_date AND dtdup < current_date + 365 GROUP BY 1 ORDER BY 1`),
+      // prazo REAL de pagamento: dias entre a entrada da nota e o vencimento, ponderado pelo valor (12 meses)
+      mart(`SELECT fornecid, round(sum((dtdup - dtent) * vrdup) / nullif(sum(vrdup),0)) dias, count(DISTINCT nrnot) notas
+              FROM stg.compra_duplicata WHERE dtent >= current_date - 365 AND dtdup BETWEEN dtent AND dtent + 365
+             GROUP BY 1`),
+    ]);
+    nomes.forEach(r=>{ fornNomes[r.fornecid] = { nome:r.nome, cidade:r.cidade, uf:r.uf, prazo:N(r.diasprazo)||null, minimo:N(r.vrminfat)||null }; });
+    prazo.forEach(r=>{ (fornNomes[r.fornecid] ||= {}).prazo_real = N(r.dias); });
+    pagar = venc.map(num);
+  }catch(e){ console.warn('[estoque] fornecedor/duplicata indisponível —', (e.message||'').slice(0,90)); }
+  return {
+    fornNomes, pagar,
+    ref: new Date().toISOString().slice(0,10),
+    skus: skus.map(num).map(r=>({...r, ult_compra:d(r.ult_compra), ult_saida:d(r.ult_saida)})),
+    resumo: resumo.map(num), parados: parados.map(num).map(r=>({...r, validade:d(r.validade), ult_saida:d(r.ult_saida), ult_compra:d(r.ult_compra)})),
+    lotes: lotes.map(num).map(r=>({...r, validade:d(r.validade)})), mensal: mensal.map(num), snapshot: snap.map(num),
+    topCusto: topCusto.map(num), suspeitos: susp.map(num), fornecedores: forn.map(num).map(r=>({...r, ultima:d(r.ultima)})),
+  };
+}
+
+// ESTOQUE ITEM — ficha de um produto: ?cdpro=NNN
+async function blocoEstoqueItem(params){
+  const cd = Number(params && params.get ? params.get('cdpro') : NaN);
+  if(!Number.isFinite(cd)) throw new Error('cdpro inválido');
+  const [sku, lotes, consumo, compras, ajustes] = await Promise.all([
+    mart(`SELECT * FROM mart.estoque_sku WHERE cdpro=${cd}`),
+    mart(`SELECT nrlot, dtval::date validade, dias, round(saldo::numeric,3) saldo, round(valor::numeric,2) valor, fantasma,
+                 situacao_validade, round(valor_em_risco::numeric,2) risco, nrnot, fornecid
+            FROM mart.estoque_lote WHERE cdpro=${cd} ORDER BY dtval NULLS LAST`),
+    mart(`SELECT to_char(dtentr,'YYYY-MM') mes, round(sum(qtreal::numeric + coalesce(nullif(qtperda::text,'')::numeric,0)),3) q,
+                 round(sum(prcusto::numeric)) custo, count(*) linhas
+            FROM stg.venda_componente WHERE cdpro=${cd} AND dtentr >= date '2025-01-01' GROUP BY 1 ORDER BY 1`),
+    mart(`SELECT dtent::date data, nrnot, fornecid, round(qtreal::numeric,3) qt, unida, round(prunir::numeric,4) preco,
+                 round(valor::numeric,2) valor, dtval::date validade
+            FROM mart.compra WHERE cdpro=${cd} ORDER BY dtent DESC LIMIT 40`),
+    mart(`SELECT datarf::date data, tipo, causa, round(quantdiferenca::numeric,3) qt, round(valor::numeric,2) valor, nrlot
+            FROM mart.estoque_ajuste WHERE cdpro=${cd} ORDER BY datarf DESC LIMIT 40`),
+  ]);
+  const d = x => x ? String(x).slice(0,10) : null;
+  return { sku: sku[0] || null,
+           lotes: lotes.map(r=>({...r, validade:d(r.validade)})), consumo,
+           compras: compras.map(r=>({...r, data:d(r.data), validade:d(r.validade)})),
+           ajustes: ajustes.map(r=>({...r, data:d(r.data)})) };
+}
+
+const BLOCOS = { ano: blocoAno, mes: blocoMes, dia: blocoDia, producao: blocoProd, busca: blocoBusca,
+                 estoque: blocoEstoque, estoqueitem: blocoEstoqueItem };
 
 // ---------- Chatbot (Nível 1): responde sobre o CONTEXTO do painel via Claude ----------
 const IA_SYS = `Você é o assistente do Portal Sinequa, o painel de gestão da Sinequa Farma (farmácia de manipulação em São Paulo). Responde perguntas do dono/gestor sobre os números do painel.

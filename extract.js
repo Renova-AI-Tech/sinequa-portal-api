@@ -151,6 +151,19 @@ const jobs=[
      CAST(QUANT AS DOUBLE PRECISION) QUANT, CAST(QTREAL AS DOUBLE PRECISION) QTREAL,
      CAST(PRUNI AS DOUBLE PRECISION) PRUNI, CAST(PRUNIR AS DOUBLE PRECISION) PRUNIR
    FROM FC11100 WHERE CDFIL=1 AND DTENT>=${DESDE}` },
+ // FC02000 = cadastro de FORNECEDORES. Sem ela o portal só mostra o código (FORNECID das notas).
+ // FANTA é o nome que o time usa (SOVITA, FAGRON, GALENA...). DIASPRAZO = prazo cadastrado;
+ // VRMINFAT = pedido mínimo. Exige GRANT SELECT ON FC02000 TO SINEQUA_RO (grant-fornecedor.js).
+ { name:'dim_fornecedor', sql:`SELECT TRIM(FORNECID) FORNECID, TRIM(RAZAO) RAZAO, TRIM(FANTA) FANTA,
+     TRIM(NRCNPJ) NRCNPJ, TRIM(MUNIC) MUNIC, TRIM(UNFED) UNFED,
+     CAST(DIASPRAZO AS DOUBLE PRECISION) DIASPRAZO, CAST(VRMINFAT AS DOUBLE PRECISION) VRMINFAT
+   FROM FC02000` },
+ // FC11200 = DUPLICATAS das notas de compra (parcelas a pagar: vencimento + valor). É o contas a
+ // pagar das COMPRAS — prazo real de pagamento por fornecedor e o que vence nos próximos meses.
+ // Tem lixo de digitação (DTDUP 1950): filtrar no uso, não aqui. Exige o mesmo GRANT (FC11200).
+ { name:'compra_duplicata', sql:`SELECT CDFIL, TRIM(FORNECID) FORNECID, DTENT, NRNOT, DTDUP,
+     CAST(VRDUP AS DOUBLE PRECISION) VRDUP, TRIM(NRDUP) NRDUP
+   FROM FC11200 WHERE CDFIL=1 AND DTENT>=${DESDE}` },
 ];
 
 // ---------- config de resiliência ----------
