@@ -471,8 +471,170 @@ async function blocoEstoqueItem(params){
            ajustes: ajustes.map(r=>({...r, data:d(r.data)})) };
 }
 
+// ============================================================
+// ATENDIMENTO — tela "Hoje" do atendimento no Kommo (WhatsApp). Lê o Kommo AO VIVO
+// (/api/v4/events), sem tabela nova: a resposta fica em cache por 2 min e, depois disso,
+// quem abre recebe o cache na hora enquanto a API busca o novo por trás.
+// Só lê metadado (quem, quando, qual lead) — o texto das mensagens nunca é buscado.
+//
+// Regras (1ª versão, a calibrar com o João):
+// · "esperando resposta" = lead aberto cuja ÚLTIMA mensagem do cliente é mais nova que a
+//   última resposta de uma PESSOA da equipe. Robô (created_by 0) não conta como resposta.
+//   Janela: mensagens desde ontem 00:00. Tempo de espera em relógio corrido.
+// · ATRASADO = esperando há mais de 1 hora.
+// · 1ª resposta = da 1ª mensagem do cliente hoje até a 1ª resposta humana depois dela.
+// Credenciais: ../sinequa-kommo/kommo.env (KOMMO_BASE, KOMMO_TOKEN) — o mesmo da recompra.
+// ============================================================
+carregaEnv(path.join(__dirname,'..','sinequa-kommo','kommo.env'));
+const KOMMO_TOKEN = (process.env.KOMMO_TOKEN||'').trim();
+let KOMMO_BASE = (process.env.KOMMO_BASE||'').trim();
+try{ KOMMO_BASE = new URL(KOMMO_BASE).origin; }catch{ KOMMO_BASE = KOMMO_BASE.replace(/\/+$/,''); }
+const _sleep = ms => new Promise(r=>setTimeout(r,ms));
+async function kommo(p, tentativa=1){
+  let r;
+  try{ r = await fetch(KOMMO_BASE+p,{ headers:{ Authorization:'Bearer '+KOMMO_TOKEN, Accept:'application/json' }, signal: AbortSignal.timeout(20000) }); }
+  catch(e){ if(tentativa<3){ await _sleep(800*tentativa); return kommo(p, tentativa+1); } throw e; }   // queda de rede: tenta de novo
+  if(r.status===429 && tentativa<3){ await _sleep(1500*tentativa); return kommo(p, tentativa+1); }       // limite de requisições do Kommo
+  if(r.status===204) return null;
+  if(!r.ok) throw new Error('kommo '+r.status+' '+p.split('?')[0]);
+  return r.json();
+}
+async function kommoEventos(tipo, desde){
+  const out=[];
+  for(let pg=1; pg<=40; pg++){
+    const j = await kommo(`/api/v4/events?filter[type][]=${tipo}&filter[created_at][from]=${desde}&limit=100&page=${pg}`);
+    const e = j?._embedded?.events || []; out.push(...e);
+    if(!j?._links?.next || !e.length) break;
+    await _sleep(120);
+  }
+  return out;
+}
+// pipelines e usuários mudam pouco: cache de 1 h
+let _kCad = null, _kCadTs = 0;
+async function kommoCadastros(){
+  if(_kCad && Date.now()-_kCadTs < 3600e3) return _kCad;
+  const [pp, us] = await Promise.all([ kommo('/api/v4/leads/pipelines'), kommo('/api/v4/users?limit=250') ]);
+  const etapas = {}, funis = {};
+  for(const p of pp?._embedded?.pipelines || []){
+    funis[p.id] = p.name;
+    for(const s of p._embedded?.statuses || []) etapas[s.id] = { nome:s.name, ordem:s.sort, funil:p.id };
+  }
+  const usuarios = {}; for(const u of us?._embedded?.users || []) usuarios[u.id] = u.name;
+  _kCad = { etapas, funis, usuarios }; _kCadTs = Date.now();
+  return _kCad;
+}
+async function kommoLeads(ids){
+  const out = {};
+  for(let i=0; i<ids.length; i+=50){
+    const q = ids.slice(i,i+50).map(id=>`filter[id][]=${id}`).join('&');
+    const j = await kommo(`/api/v4/leads?${q}&limit=250`);
+    for(const l of j?._embedded?.leads || []) out[l.id] = l;
+  }
+  return out;
+}
+// meia-noite de hoje em São Paulo (epoch s); o Brasil não tem horário de verão desde 2019
+function _meiaNoiteSP(){ const d = new Date().toLocaleDateString('en-CA',{timeZone:'America/Sao_Paulo'}); return Math.floor(new Date(d+'T00:00:00-03:00').getTime()/1000); }
+const _horaSP = s => +new Date(s*1000).toLocaleString('en-US',{timeZone:'America/Sao_Paulo',hour:'2-digit',hour12:false}) % 24;
+const _mediana = a => { if(!a.length) return null; const s=[...a].sort((x,y)=>x-y); return s[Math.floor(s.length/2)]; };
+
+async function montaAtendimento(){
+  if(!KOMMO_TOKEN || !KOMMO_BASE) throw new Error('Kommo não configurado (kommo.env)');
+  const agora = Math.floor(Date.now()/1000), hoje = _meiaNoiteSP(), ontem = hoje-86400, base28 = hoje-28*86400;
+  const [ent, sai, novos, cad, erp] = await Promise.all([
+    kommoEventos('incoming_chat_message', ontem),
+    kommoEventos('outgoing_chat_message', ontem),
+    kommoEventos('lead_added', base28),
+    kommoCadastros(),
+    Promise.all([
+      mart(`SELECT round(orcado) orcado FROM mart.diario WHERE data=current_date`),
+      mart(`SELECT count(DISTINCT nrorc) n FROM mart.f_orcamento WHERE dtentr::date=current_date`),
+    ]).catch(e=>{ console.warn('[atendimento] ERP indisponível —', e.message.slice(0,80)); return null; }),
+  ]);
+  // ---- por lead: última msg do cliente, última resposta humana, 1ª msg de hoje e 1ª resposta depois dela
+  const L = {};
+  const lead = id => (L[id] ||= { inUlt:0, outUlt:0, outQuem:null, inPrim:null, inHoje:0, outHoje:0 });
+  for(const e of ent){ if(e.entity_type!=='lead') continue; const x=lead(e.entity_id);
+    if(e.created_at>x.inUlt) x.inUlt=e.created_at;
+    if(e.created_at>=hoje){ x.inHoje++; if(!x.inPrim || e.created_at<x.inPrim) x.inPrim=e.created_at; } }
+  const humanas = sai.filter(e=>e.entity_type==='lead' && e.created_by);
+  for(const e of humanas){ const x=lead(e.entity_id);
+    if(e.created_at>x.outUlt){ x.outUlt=e.created_at; x.outQuem=e.created_by; }
+    if(e.created_at>=hoje) x.outHoje++; }
+  // 1ª resposta humana de hoje: primeira saída humana depois da 1ª entrada de hoje
+  const tResp = [];
+  for(const [id,x] of Object.entries(L)){
+    if(!x.inPrim) continue;
+    let r=null; for(const e of humanas) if(e.entity_id==id && e.created_at>=x.inPrim && (!r || e.created_at<r)) r=e.created_at;
+    if(r) tResp.push((r-x.inPrim)/60);
+  }
+  // ---- fila: esperando resposta (busca etapa/nome só desses leads + os criados hoje)
+  const esperaIds = Object.entries(L).filter(([,x])=>x.inUlt>x.outUlt).map(([id])=>+id);
+  const novosHoje = novos.filter(e=>e.created_at>=hoje && e.entity_type==='lead');
+  const idsHoje = [...new Set(novosHoje.map(e=>e.entity_id))];
+  const det = await kommoLeads([...new Set([...esperaIds, ...idsHoje])]);
+  const FECHADO = new Set([142,143]);   // 142 = ganho, 143 = perdido (fixo no Kommo)
+  const etapa = l => l ? (cad.etapas[l.status_id]?.nome || (l.status_id===142?'Ganho':l.status_id===143?'Perdido':'—')) : '—';
+  const fila = esperaIds.map(id=>{ const x=L[id], l=det[id];
+      return { id, nome: l?.name || null, etapa: etapa(l), funil: l ? cad.funis[l.pipeline_id]||null : null,
+               desde: x.inUlt, espera_min: Math.round((agora-x.inUlt)/60),
+               ultimo: x.outQuem ? cad.usuarios[x.outQuem]||null : null, valor: l?.price||0, novo: idsHoje.includes(id),
+               fechado: l ? FECHADO.has(l.status_id) : false }; })
+    .filter(f=>!f.fechado).sort((a,b)=>b.espera_min-a.espera_min);
+  // ---- leads por hora: hoje × média dos 4 últimos mesmos dias da semana
+  const dowHoje = new Date(hoje*1000).getUTCDay();   // meia-noite SP = 03:00 UTC → mesmo dia
+  const porHora = Array.from({length:24},()=>({hoje:0, media:0}));
+  novosHoje.forEach(e=>porHora[_horaSP(e.created_at)].hoje++);
+  let diasRef = 0, totRef = 0; const vistos = new Set();
+  for(let k=1;k<=4;k++){ const ini=hoje-7*k*86400, fim=ini+86400; vistos.add(ini);
+    const dia = novos.filter(e=>e.entity_type==='lead' && e.created_at>=ini && e.created_at<fim);
+    dia.forEach(e=>porHora[_horaSP(e.created_at)].media+=1/4); totRef+=dia.length; diasRef++; }
+  // até esta hora nos mesmos dias (para comparar o parcial de hoje com o parcial deles)
+  // a hora corrente entra proporcional aos minutos já passados (às 15h25, 25/60 da média das 15h)
+  const hAgora = _horaSP(agora), fracHora = ((agora-hoje)%3600)/3600; let ateAgoraRef = 0;
+  for(let h=0; h<hAgora; h++) ateAgoraRef += porHora[h].media;
+  ateAgoraRef += porHora[hAgora].media*fracHora;
+  const msgHora = Array.from({length:24},()=>({entrou:0, saiu:0}));
+  ent.filter(e=>e.created_at>=hoje).forEach(e=>msgHora[_horaSP(e.created_at)].entrou++);
+  humanas.filter(e=>e.created_at>=hoje).forEach(e=>msgHora[_horaSP(e.created_at)].saiu++);
+  // ---- onde os leads de hoje estão agora
+  const porEtapa = {};
+  idsHoje.forEach(id=>{ const l=det[id]; const nome=etapa(l); const o=(porEtapa[nome] ||= {etapa:nome, ordem: l? (cad.etapas[l.status_id]?.ordem ?? (l.status_id===142?9e3:9e3+1)) : 1e4, n:0, valor:0}); o.n++; o.valor+=l?.price||0; });
+  const espera = fila.length, atrasado = fila.filter(f=>f.espera_min>60).length;
+  const ultimoEvento = Math.max(0, ...ent.map(e=>e.created_at), ...sai.map(e=>e.created_at));
+  return {
+    gerado: new Date().toISOString(), kommo: KOMMO_BASE,
+    ultimo_evento_min: ultimoEvento ? Math.round((agora-ultimoEvento)/60) : null,
+    leads: { hoje: idsHoje.length, media_dia: diasRef? Math.round(totRef/diasRef*10)/10 : null,
+             media_ate_agora: Math.round(ateAgoraRef*10)/10, hora_agora: hAgora, dow: dowHoje },
+    espera: { total: espera, atrasado },
+    resposta: { mediana_min: _mediana(tResp)!=null ? Math.round(_mediana(tResp)) : null,
+                ate15: tResp.length ? Math.round(tResp.filter(m=>m<=15).length/tResp.length*1000)/1000 : null,
+                n: tResp.length },
+    mensagens: { recebidas: ent.filter(e=>e.created_at>=hoje).length,
+                 humanas: humanas.filter(e=>e.created_at>=hoje).length,
+                 robo: sai.filter(e=>e.created_at>=hoje && !e.created_by).length,
+                 conversas: Object.values(L).filter(x=>x.inHoje).length },
+    erp: erp ? { orcado: N(erp[0][0]?.orcado), n: N(erp[1][0]?.n) } : null,
+    porHora: porHora.map((h,i)=>({h:i, hoje:h.hoje, media:Math.round(h.media*10)/10})),
+    msgHora: msgHora.map((h,i)=>({h:i, ...h})),
+    etapas: Object.values(porEtapa).sort((a,b)=>a.ordem-b.ordem).map(({etapa,n,valor})=>({etapa,n,valor})),
+    fila,
+  };
+}
+let _atd = null, _atdTs = 0, _atdBusca = null;
+function _buscaAtd(){
+  if(!_atdBusca) _atdBusca = montaAtendimento().then(d=>{ _atd=d; _atdTs=Date.now(); return d; }).finally(()=>{ _atdBusca=null; });
+  return _atdBusca;
+}
+async function blocoAtendimento(){
+  const idade = Date.now()-_atdTs;
+  if(_atd && idade < 120e3) return _atd;
+  if(_atd && idade < 15*60e3){ _buscaAtd().catch(e=>console.error('[atendimento]', e.message)); return _atd; }  // entrega o anterior e atualiza por trás
+  return _buscaAtd();
+}
+
 const BLOCOS = { ano: blocoAno, mes: blocoMes, dia: blocoDia, producao: blocoProd, busca: blocoBusca,
-                 estoque: blocoEstoque, estoqueitem: blocoEstoqueItem };
+                 estoque: blocoEstoque, estoqueitem: blocoEstoqueItem, atendimento: blocoAtendimento };
 
 // ---------- Chatbot (Nível 1): responde sobre o CONTEXTO do painel via Claude ----------
 const IA_SYS = `Você é o assistente do Portal Sinequa, o painel de gestão da Sinequa Farma (farmácia de manipulação em São Paulo). Responde perguntas do dono/gestor sobre os números do painel.
