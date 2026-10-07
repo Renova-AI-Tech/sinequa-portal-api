@@ -682,6 +682,32 @@ async function chat(messages, contexto){
   return (j.content||[]).filter(b=>b.type==='text').map(b=>b.text).join('').trim() || '(sem resposta)';
 }
 
+// ---------- FILA DE ORÇAMENTOS (pedidos dos grupos de WhatsApp) ----------
+// A fila mora no serviço do WhatsApp (sinequa-whatsapp/recebe-whatsapp.js, 127.0.0.1:8095), que tem o banco, as
+// receitas no disco e o estado de quem assumiu. Aqui só confere a chave e repassa:
+//   GET /portal/fila  ·  POST /portal/fila/acao  ·  GET /portal/midia/<id>?key=  (a imagem vai num <img>, por isso aceita ?key=)
+const WHATS = (process.env.WHATS_URL || 'http://127.0.0.1:8095').replace(/\/$/,'');
+// Senha dos orçamentistas: FILA_SENHA (env) ou a linha FILA_SENHA do whatsapp.env (lê SÓ essa linha — o resto daquele
+// arquivo tem PGHOST etc., que mudariam o backend desta API). Quem acerta a senha recebe a chave do portal.
+function filaSenha(){
+  if(process.env.FILA_SENHA) return process.env.FILA_SENHA;
+  try{ const m = fs.readFileSync(path.join(__dirname,'..','sinequa-whatsapp','whatsapp.env'),'utf8').match(/^\s*FILA_SENHA\s*=\s*(.*?)\s*$/m); return m ? m[1] : ''; }catch{ return ''; }
+}
+const _tentativas = new Map();   // ip → [instantes] — freia chute de senha (10 por 10 min)
+async function repassa(req, res, origem, destino){
+  try{
+    const corpo = req.method==='POST' ? await lerCorpo(req) : undefined;
+    const r = await fetch(WHATS+destino, { method:req.method, headers: corpo ? {'content-type':'application/json'} : {}, body:corpo, signal:AbortSignal.timeout(30000) });
+    const h = { 'Content-Type': r.headers.get('content-type')||'application/json', 'Cache-Control': r.headers.get('cache-control')||'no-store' };
+    if(r.headers.get('content-disposition')) h['Content-Disposition'] = r.headers.get('content-disposition');
+    if(ORIGENS.includes('*')) h['Access-Control-Allow-Origin']='*'; else if(origem && ORIGENS.includes(origem)){ h['Access-Control-Allow-Origin']=origem; h['Vary']='Origin'; }
+    res.writeHead(r.status, h); res.end(Buffer.from(await r.arrayBuffer()));
+  }catch(e){
+    console.error('[fila]', e.message);
+    responde(res, origem, 503, { erro:'O serviço do WhatsApp não respondeu. Ele roda no servidor pela tarefa Sinequa WhatsApp.' });
+  }
+}
+
 // ---------- HTTP ----------
 function responde(res, origem, status, corpo){
   const h = {'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'};
@@ -709,6 +735,22 @@ const servidor = http.createServer(async (req,res)=>{
       console.error('[chat]', e.message);
       return responde(res,origem, semKey?503:500, {erro: semKey?'O assistente ainda não está configurado no servidor.':'Não consegui responder agora.', detalhe:(e.message||'').slice(0,300)});
     }
+  }
+  if(req.method==='GET' && (url.pathname==='/fila' || url.pathname==='/fila/')) return repassa(req, res, origem, '/fila.html');   // tela dos orçamentistas
+  if(req.method==='POST' && url.pathname==='/portal/fila/entrar'){
+    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || '?', agora = Date.now();
+    const t = (_tentativas.get(ip) || []).filter(x => agora - x < 10*60e3);
+    if(t.length >= 10) return responde(res, origem, 429, { erro:'Muitas tentativas. Espere alguns minutos.' });
+    const senha = filaSenha();
+    if(!senha) return responde(res, origem, 503, { erro:'A senha da fila ainda não foi configurada no servidor.' });
+    let b = {}; try{ b = JSON.parse(await lerCorpo(req) || '{}'); }catch{}
+    if(String(b.senha||'') !== senha){ t.push(agora); _tentativas.set(ip, t); return responde(res, origem, 401, { erro:'Senha incorreta.' }); }
+    return responde(res, origem, 200, { chave: TOKEN });
+  }
+  if(url.pathname==='/portal/fila' || url.pathname==='/portal/fila/acao' || /^\/portal\/midia\/[A-Za-z0-9_-]+$/.test(url.pathname)){
+    const key = req.headers['x-portal-key'] || url.searchParams.get('key') || '';
+    if(key!==TOKEN) return responde(res,origem,401,{erro:'não autorizado'});
+    return repassa(req, res, origem, url.pathname.replace(/^\/portal/,''));
   }
   const m = url.pathname.match(/^\/portal\/([a-z]+)$/);
   if(!m || !BLOCOS[m[1]]) return responde(res,origem,404,{erro:'rota desconhecida'});
