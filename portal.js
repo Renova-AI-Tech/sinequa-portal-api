@@ -686,6 +686,7 @@ async function chat(messages, contexto){
 // A fila mora no serviço do WhatsApp (sinequa-whatsapp/recebe-whatsapp.js, 127.0.0.1:8095), que tem o banco, as
 // receitas no disco e o estado de quem assumiu. Aqui só confere a chave e repassa:
 //   GET /portal/fila  ·  POST /portal/fila/acao  ·  GET /portal/midia/<id>?key=  (a imagem vai num <img>, por isso aceita ?key=)
+//   GET /portal/erp-orcamento/<nº>  (orçamento do Fórmula Certa ao vivo, para o "Validar com o ERP")
 const WHATS = (process.env.WHATS_URL || 'http://127.0.0.1:8095').replace(/\/$/,'');
 // Senha dos orçamentistas: FILA_SENHA (env) ou a linha FILA_SENHA do whatsapp.env (lê SÓ essa linha — o resto daquele
 // arquivo tem PGHOST etc., que mudariam o backend desta API). Quem acerta a senha recebe a chave do portal.
@@ -747,7 +748,7 @@ const servidor = http.createServer(async (req,res)=>{
     if(String(b.senha||'') !== senha){ t.push(agora); _tentativas.set(ip, t); return responde(res, origem, 401, { erro:'Senha incorreta.' }); }
     return responde(res, origem, 200, { chave: TOKEN });
   }
-  if(url.pathname==='/portal/fila' || url.pathname==='/portal/fila/acao' || /^\/portal\/midia\/[A-Za-z0-9_-]+$/.test(url.pathname)){
+  if(url.pathname==='/portal/fila' || url.pathname==='/portal/fila/acao' || /^\/portal\/midia\/[A-Za-z0-9_-]+$/.test(url.pathname) || /^\/portal\/erp-orcamento\/\d{1,8}$/.test(url.pathname)){
     const key = req.headers['x-portal-key'] || url.searchParams.get('key') || '';
     if(key!==TOKEN) return responde(res,origem,401,{erro:'não autorizado'});
     return repassa(req, res, origem, url.pathname.replace(/^\/portal/,''));
