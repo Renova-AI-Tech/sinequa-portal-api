@@ -9,10 +9,10 @@
 //     então ligar no portal é trocar os const por fetch, sem mudar render.
 //
 // Rodar via Metabase/Tailscale (deste ambiente):
-//   MB_URL=http://100.69.211.55:3000 PORTAL_TOKEN=sinequa2026 node portal.js
+//   MB_URL=http://100.69.211.55:3000 PORTAL_TOKEN=<chave do api.env> node portal.js
 // Rodar via Postgres direto (no servidor, onde o pg é localhost):
 //   npm install   # instala o pg (ver package.json)
-//   PORTAL_DB=pg PGDATABASE=sinequa PORTAL_TOKEN=sinequa2026 node portal.js
+//   PORTAL_DB=pg PGDATABASE=sinequa PORTAL_TOKEN=<chave do api.env> node portal.js
 //   (também aceita PGHOST/PGPORT/PGUSER/PGPASSWORD ou DATABASE_URL)
 const http = require('http');
 const path = require('path');
@@ -26,7 +26,13 @@ carregaEnv(path.join(__dirname,'portal.env'));                      // opcional:
 const PORTA  = Number(process.env.PORTAL_PORT || 8092);
 const MB     = (process.env.MB_URL || 'http://localhost:3000').replace(/\/$/,'');
 const MBKEY  = process.env.MB_API_KEY || '';
-const TOKEN  = process.env.PORTAL_TOKEN || 'sinequa2026';
+// sem chave padrão no código (revisão de 20/10/2026, decisão do João): sem PORTAL_TOKEN a API recusa tudo
+const TOKEN  = (process.env.PORTAL_TOKEN || '').trim();
+if(!TOKEN) console.error('[portal] PORTAL_TOKEN não configurado: a API vai recusar todos os acessos até configurar.');
+// a senha da fila dá só esta chave, que abre a fila e a mídia dos pedidos; os blocos (busca de pacientes etc.) exigem
+// a chave mestra. Derivada da mestra: trocar a PORTAL_TOKEN troca as duas.
+const FILA_CHAVE = TOKEN ? require('crypto').createHmac('sha256', TOKEN).update('fila').digest('hex') : '';
+const chaveOk = (key, aceita) => !!key && aceita.filter(Boolean).includes(key);
 const ORIGENS = (process.env.PORTAL_ORIGENS || '*').split(',').map(s=>s.trim());
 carregaEnv(path.join(__dirname,'ia.env'));                          // opcional: ANTHROPIC_API_KEY, CHAT_MODEL
 const IA_KEY   = process.env.ANTHROPIC_API_KEY || '';
@@ -724,7 +730,7 @@ const servidor = http.createServer(async (req,res)=>{
   // Chatbot — POST /portal/chat {messages:[{role,content}], contexto}
   if(req.method==='POST' && url.pathname==='/portal/chat'){
     const key = req.headers['x-portal-key'] || url.searchParams.get('key') || '';
-    if(key!==TOKEN) return responde(res,origem,401,{erro:'não autorizado'});
+    if(!chaveOk(key, [TOKEN])) return responde(res,origem,401,{erro:'não autorizado'});
     try{
       const body = JSON.parse((await lerCorpo(req)) || '{}');
       const messages = Array.isArray(body.messages) ? body.messages.filter(m=>m&&m.role&&m.content).slice(-12) : [];
@@ -746,18 +752,18 @@ const servidor = http.createServer(async (req,res)=>{
     if(!senha) return responde(res, origem, 503, { erro:'A senha da fila ainda não foi configurada no servidor.' });
     let b = {}; try{ b = JSON.parse(await lerCorpo(req) || '{}'); }catch{}
     if(String(b.senha||'') !== senha){ t.push(agora); _tentativas.set(ip, t); return responde(res, origem, 401, { erro:'Senha incorreta.' }); }
-    return responde(res, origem, 200, { chave: TOKEN });
+    return responde(res, origem, 200, { chave: FILA_CHAVE });
   }
   if(url.pathname==='/portal/fila' || url.pathname==='/portal/fila/acao' || /^\/portal\/midia\/[A-Za-z0-9_-]+$/.test(url.pathname) || /^\/portal\/erp-orcamento\/\d{1,8}$/.test(url.pathname)){
     const key = req.headers['x-portal-key'] || url.searchParams.get('key') || '';
-    if(key!==TOKEN) return responde(res,origem,401,{erro:'não autorizado'});
+    if(!chaveOk(key, [TOKEN, FILA_CHAVE])) return responde(res,origem,401,{erro:'não autorizado'});
     return repassa(req, res, origem, url.pathname.replace(/^\/portal/,''));
   }
   const m = url.pathname.match(/^\/portal\/([a-z]+)$/);
   if(!m || !BLOCOS[m[1]]) return responde(res,origem,404,{erro:'rota desconhecida'});
   // auth — token compartilhado
   const key = req.headers['x-portal-key'] || url.searchParams.get('key') || '';
-  if(key!==TOKEN) return responde(res,origem,401,{erro:'não autorizado'});
+  if(!chaveOk(key, [TOKEN])) return responde(res,origem,401,{erro:'não autorizado'});
   try{
     const dados = await BLOCOS[m[1]](url.searchParams);
     return responde(res,origem,200,dados);
@@ -770,5 +776,5 @@ const servidor = http.createServer(async (req,res)=>{
 servidor.listen(PORTA,()=>{
   const fonte = USA_PG ? (process.env.DATABASE_URL?'DATABASE_URL':`${process.env.PGHOST||'localhost'}:${process.env.PGPORT||5432}/${process.env.PGDATABASE||'sinequa'}`) : MB;
   console.log(`API do Portal em http://localhost:${PORTA}  (mart via ${BACKEND} → ${fonte})`);
-  console.log(`  teste: curl -s "http://localhost:${PORTA}/portal/ano?key=${TOKEN}"`);
+  console.log(`  teste: curl -s -H "x-portal-key: <PORTAL_TOKEN do api.env>" "http://localhost:${PORTA}/portal/ano"`);   // a chave não vai para o log
 });
